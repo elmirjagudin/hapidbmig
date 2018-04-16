@@ -5,6 +5,7 @@ Revises:
 Create Date: 2018-04-13 13:53:54.433682
 
 """
+import json
 from alembic import op
 import sqlalchemy as sa
 
@@ -43,6 +44,15 @@ def upgrade_users():
         existing_nullable=False,
     )
 
+    # drop 'not null' constraint
+    op.alter_column(
+        table,
+        "note",
+        type_=sa.Text,
+        existing_nullable=False,
+        nullable=True,
+    )
+
     op.create_unique_constraint(
         None,
         table,
@@ -64,6 +74,7 @@ def upgrade_devices():
 
     id_to_serno = _fetch_id_to_name()
 
+    # rename column deviceName to serialNo
     op.alter_column(
         table,
         "deviceName",
@@ -72,6 +83,7 @@ def upgrade_devices():
         existing_nullable=False,
     )
 
+    # drop 'id' column
     op.drop_constraint("firmware_ibfk_1", "firmware", "foreignkey")
     op.drop_constraint("modelConfigs_ibfk_1", "modelConfigs", "foreignkey")
 
@@ -80,11 +92,18 @@ def upgrade_devices():
         "id"
     )
 
-    # TODO on firmware table add foreignkey constraint on firmware.device
-
+    # make 'serialNo' new primary key
     op.create_primary_key(
         None, table,
         ["serialNo"]
+    )
+
+    # drop 'not null' constraint from 'note' column
+    op.alter_column(
+        table,
+        "note",
+        type_=sa.Text,
+        nullable=True,
     )
 
     return id_to_serno
@@ -126,7 +145,7 @@ def upgrade_firmware(id_to_serno):
 def upgrade_sweref_pos():
     table = "sweref_pos"
 
-    op.create_table(
+    return op.create_table(
         table,
         sa.Column("id", sa.INTEGER, primary_key=True),
         sa.Column("projection", sa.VARCHAR(8)),
@@ -203,7 +222,6 @@ def upgrade_models():
         ["id"],
     )
 
-
     op.add_column(table,
                   sa.Column("defaultPosition",
                             sa.Integer,
@@ -211,13 +229,202 @@ def upgrade_models():
     op.add_column(table, sa.Column("description", sa.Text))
 
 
+def upgrade_assets():
+    table = "assets"
+
+    op.alter_column(
+        table,
+        "model_id",
+        new_column_name="model",
+        type_= sa.Integer,
+    )
+
+
+def upgrade_rest_endpoints():
+    table = "rest_endpoints"
+
+    op.create_table(
+        table,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("url", sa.Text),
+        sa.Column("method", sa.Text),
+    )
+
+
+def upgrade_http_headers():
+    table = "http_headers"
+
+    op.create_table(
+        table,
+        sa.Column("name", sa.String(64), primary_key=True),
+        sa.Column("value", sa.Text),
+        sa.Column("restEndpoint",
+                  sa.Integer,
+                  sa.ForeignKey("rest_endpoints.id"),
+                  primary_key=True),
+    )
+
+
+def upgrade_subscriptions():
+    table = "subscriptions"
+
+    op.create_table(
+        table,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("expiration", sa.Integer),
+        sa.Column("device", sa.String(16),
+                  sa.ForeignKey("devices.serialNo", ondelete="cascade"),
+                  nullable=False),
+        sa.Column("restEndpoint",
+                  sa.Integer,
+                  sa.ForeignKey("rest_endpoints.id", ondelete="cascade")),
+        # collate and charset must be set, so
+        # that collation of 'device' column matches
+        # collation of 'devices.serialNo' column
+        mysql_COLLATE="utf8_unicode_ci",
+        mysql_DEFAULT_CHARSET='utf8',
+    )
+
+
+def upgrade_event_topics():
+    table = "event_topics"
+
+    op.create_table(
+        table,
+        sa.Column("topic", sa.String(64), primary_key=True),
+        sa.Column("subscription",
+                  sa.Integer,
+                  sa.ForeignKey("subscriptions.id"),
+                  primary_key=True),
+    )
+
+
+#
+# contains insert values for a row in 'sweref_pos' table
+#
+class Position:
+    PROJS = {
+        "sweref_99_tm": "TM",
+        "sweref_99_12_00": "12 00",
+        "sweref_99_13_30": "13 30",
+        "sweref_99_15_00": "15 00",
+        "sweref_99_16_30": "16 30",
+        "sweref_99_18_00": "18 00",
+        "sweref_99_14_15": "14 15",
+        "sweref_99_15_45": "15 45",
+        "sweref_99_17_15": "17 15",
+        "sweref_99_18_45": "18 45",
+        "sweref_99_20_15": "20 15",
+        "sweref_99_21_45": "21 45",
+        "sweref_99_23_15": "23 15",
+    }
+
+    def __init__(self, vals):
+        def _filter_empty(val):
+            if val == "":
+                return 0.0
+            return val
+
+        self.insert_dict = dict(
+            projection=Position.PROJS[vals["userProjectionRef"]],
+            x=_filter_empty(vals["userLatitudeX"]),
+            y=_filter_empty(vals["userLongitudeY"]),
+            z=_filter_empty(vals["userAltitude"]),
+            yaw=vals["userRotation"],
+        )
+
+#
+# contains insert values for a row in 'model_instances' table
+#
+class ModelInstance:
+    def __init__(self, device, model, conf):
+        self.insert_dict = dict(
+            device=device,
+            model=model,
+            hidden=conf["hide"],
+            name=conf["name"],
+        )
+
+        self.pos = Position(conf)
+
+
+def upgrade_model_instances(sweref_pos_table, id_to_serno):
+    def _mod_conf_as_inst(con, id_to_serno):
+        # convert data stored in 'modelConfigs' into
+        # representation that can be stored in 'model_instances'
+        # and 'swref_pos' tables
+        r = con.execute("select deviceID, modelID, configuration from modelConfigs")
+        for dev_id, mod_id, conf_json in r:
+            conf = json.loads(conf_json)
+            if conf["userProjectionRef"] == "osgb36":
+                raise Exception("Can't migrate model %s on dev %s, "
+                                "it's got osgb36 projection" % (mod_id, id_to_serno[dev_id]))
+            yield ModelInstance(id_to_serno[dev_id], mod_id, conf)
+
+    # first, we make 'model_instances' table
+    table = op.create_table(
+        "model_instances",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("name", sa.Text),
+        sa.Column("description", sa.Text),
+        sa.Column("hidden", sa.Boolean, server_default="0"),
+        sa.Column("model", sa.Integer, sa.ForeignKey("models.id")),
+        sa.Column("position", sa.Integer, sa.ForeignKey("sweref_pos.id")),
+        sa.Column("device", sa.String(16), sa.ForeignKey("devices.serialNo")),
+        # collate and charset must be set, so
+        # that collation of 'device' column matches
+        # collation of 'devices.serialNo' column
+        mysql_COLLATE="utf8_unicode_ci",
+        mysql_DEFAULT_CHARSET='utf8',
+    )
+
+
+    # then, we convert data in 'modelConfigs' table and
+    # put it in 'sweref_pos' and 'model_instances' tables
+    con = op.get_bind()
+
+    for inst in _mod_conf_as_inst(con, id_to_serno):
+        pos = inst.pos
+        r = con.execute(sweref_pos_table.insert(),
+                        pos.insert_dict)
+
+        inst.insert_dict["position"] = r.inserted_primary_key[0]
+
+        con.execute(table.insert(), inst.insert_dict)
+
+
+    # an lastly, retire 'modelConfigs' table to valhalla
+    op.drop_table("modelConfigs")
+
+
+def upgrade_sessions():
+    table = "sessions"
+
+    op.create_table(
+        table,
+        sa.Column("id", sa.String(32), primary_key=True),
+        sa.Column("access", sa.Integer),
+        sa.Column("data", sa.Text),
+    )
+
+
 def upgrade():
     upgrade_admins()
     upgrade_users()
     id_to_serial_no = upgrade_devices()
     upgrade_firmware(id_to_serial_no)
-    upgrade_sweref_pos()
+    upgrade_rest_endpoints()
+    upgrade_subscriptions()
+    upgrade_http_headers()
+    upgrade_event_topics()
+    sweref_pos_table = upgrade_sweref_pos()
     upgrade_models()
+    upgrade_model_instances(sweref_pos_table, id_to_serial_no)
+    upgrade_assets()
+    upgrade_sessions()
+
+    # it's not used anymore
+    op.drop_table("modelSWEREFPositions")
 
 
 def downgrade():
