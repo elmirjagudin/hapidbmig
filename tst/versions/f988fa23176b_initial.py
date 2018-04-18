@@ -361,6 +361,27 @@ def upgrade_model_instances(sweref_pos_table, id_to_serno):
                                 "it's got osgb36 projection" % (mod_id, id_to_serno[dev_id]))
             yield ModelInstance(id_to_serno[dev_id], mod_id, conf)
 
+    def _drop_invalid_model_instances(con):
+        #
+        # We need to remove invalid instances, that is
+        # instantiated model and device have different organization ID,
+        # then remove the it.
+        #
+        # The reason that such instances can exist, is due to old bug in
+        # the cloud code, where modelConfigs row where not properly purged
+        # when device's organization was changed.
+        # Thus, a device would potentially still have modelConfigs for
+        # models in the old organization.
+        query = \
+            "select mi.id, mi.position from model_instances as mi, devices, models " \
+            "    where devices.serialNo = mi.device and " \
+            "           models.id = mi.model and " \
+            "           devices.orgID != models.orgID"
+
+        for mid, pos_id in con.execute(query):
+            con.execute("delete from model_instances where id = '%s'" % mid)
+            con.execute("delete from sweref_pos where id = '%s'" % pos_id)
+
     # first, we make 'model_instances' table
     table = op.create_table(
         "model_instances",
@@ -393,8 +414,11 @@ def upgrade_model_instances(sweref_pos_table, id_to_serno):
         con.execute(table.insert(), inst.insert_dict)
 
 
-    # an lastly, retire 'modelConfigs' table to valhalla
+    # then, retire 'modelConfigs' table to valhalla
     op.drop_table("modelConfigs")
+
+    # and now drop invalid model instances
+    _drop_invalid_model_instances(con)
 
 
 def upgrade_sessions():
