@@ -118,7 +118,7 @@ def upgrade_firmware(id_to_serno):
         con = op.get_bind()
 
         for id, serno in id_to_serno.items():
-            r = con.execute(
+            con.execute(
                 "update firmware set device='%s' where device = '%s';" % \
                 (serno, id))
 
@@ -361,6 +361,28 @@ def upgrade_model_instances(sweref_pos_table, id_to_serno):
                                 "it's got osgb36 projection" % (mod_id, id_to_serno[dev_id]))
             yield ModelInstance(id_to_serno[dev_id], mod_id, conf)
 
+    def _missing_mod_inst():
+        #
+        # get a list of 'missing' model instances for each device
+        #
+        # While migrating we create model instances from the data in modelConfigs table,
+        # however model config entries were created lazily, only when we needed to write
+        # new model config.
+        #
+        # Thus, for devices will not have modelConfig for models it's supposted to have
+        # instantiated in the database.
+        #
+        # List all model ID from the same organization as the device, that are
+        # missing a model instance.
+        #
+        r = con.execute(
+            "select models.id, models.name, devices.serialNo "
+                "from models, devices where models.orgID = devices.orgID and "
+                "models.id not in (select model from model_instances)")
+
+        for mod_id, mod_name, serno in r:
+            yield mod_id, mod_name, serno
+
     def _drop_invalid_model_instances(con):
         #
         # We need to remove invalid instances, that is
@@ -414,11 +436,22 @@ def upgrade_model_instances(sweref_pos_table, id_to_serno):
         con.execute(table.insert(), inst.insert_dict)
 
 
-    # then, retire 'modelConfigs' table to valhalla
+    # then, retire 'modelConfigs' table
     op.drop_table("modelConfigs")
 
     # and now drop invalid model instances
     _drop_invalid_model_instances(con)
+
+    for mod_id, mod_name, device in _missing_mod_inst():
+        r = con.execute(sweref_pos_table.insert(),
+                        dict(projection="TM", x=int(mod_id), y=0, z=0))
+        pos_id = r.inserted_primary_key[0]
+        con.execute(table.insert(),
+                    dict(model=mod_id,
+                         name=mod_name,
+                         device=device,
+                         hidden=False,
+                         position=pos_id))
 
 
 def upgrade_sessions():
